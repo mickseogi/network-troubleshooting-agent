@@ -1,4 +1,6 @@
 import os
+import math
+from pathlib import Path
 from typing import List
 
 from dotenv import load_dotenv
@@ -8,7 +10,9 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers.pydantic import PydanticOutputParser
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 
 load_dotenv()
@@ -17,6 +21,8 @@ app = FastAPI(title="Network Troubleshooting Agent")
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 diagnosis_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
+DOCS_DIR = Path("docs")
 
 class ChatRequest(BaseModel):
     question: str
@@ -40,6 +46,104 @@ PROBLEM_TYPES = [
     "GATEWAY_OR_ROUTING_ISSUE",
     "UNKNOWN_NETWORK_ISSUE",
 ]
+
+
+class SimpleVectorStore:
+    def __init__(self):
+        self.docs: List[dict] = []
+
+    @staticmethod
+    def _cosine_sim(a: List[float], b: List[float]) -> float:
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(y * y for y in b))
+        return dot / (na * nb + 1e-10)
+
+    def add_documents(self, docs: List[Document]) -> int:
+        texts = [doc.page_content for doc in docs]
+        embeddings = embedding_model.embed_documents(texts)
+
+        for doc, embedding in zip(docs, embeddings):
+            self.docs.append(
+                {
+                    "page_content": doc.page_content,
+                    "metadata": doc.metadata,
+                    "embedding": embedding,
+                }
+            )
+
+        return len(self.docs)
+
+    def similarity_search(self, query: str, k: int = 3) -> List[Document]:
+        if not self.docs:
+            return []
+
+        query_embedding = embedding_model.embed_query(query)
+
+        scored_docs = [
+            (self._cosine_sim(query_embedding, doc["embedding"]), doc)
+            for doc in self.docs
+        ]
+
+        scored_docs.sort(key=lambda x: x[0], reverse=True)
+
+        return [
+            Document(
+                page_content=doc["page_content"],
+                metadata=doc["metadata"],
+            )
+            for _, doc in scored_docs[:k]
+        ]
+
+    def clear(self):
+        self.docs = []
+
+
+rag_store = SimpleVectorStore()
+rag_ready = False
+
+
+def load_rag_documents():
+    """
+    docs 폴더의 Markdown 문서를 읽고 SimpleVectorStore에 저장한다.
+    """
+    global rag_ready
+
+    if not DOCS_DIR.exists():
+        rag_ready = False
+        return 0
+
+    documents = []
+
+    for file_path in DOCS_DIR.glob("*.md"):
+        content = file_path.read_text(encoding="utf-8")
+
+        documents.append(
+            Document(
+                page_content=content,
+                metadata={"source": file_path.name},
+            )
+        )
+
+    if not documents:
+        rag_ready = False
+        return 0
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=80,
+    )
+
+    split_documents = text_splitter.split_documents(documents)
+
+    rag_store.clear()
+    count = rag_store.add_documents(split_documents)
+    rag_ready = True
+
+    return count
+
+
+rag_document_count = load_rag_documents()
 
 
 @tool
@@ -138,6 +242,31 @@ def command_recommendation_tool(problem_type: str) -> List[str]:
     return command_map.get(problem_type, command_map["UNKNOWN_NETWORK_ISSUE"])
 
 
+@tool
+def rag_search_tool(question: str) -> str:
+    """
+    사용자의 질문과 관련된 네트워크 트러블슈팅 문서 검색
+    """
+    if not rag_ready:
+        return "검색 가능한 RAG 문서가 없습니다."
+    
+    documents = rag_store.similarity_search(question, k=3)
+
+    if not documents:
+        return "관련 문서를 찾지 못했습니다."
+    
+    results = []
+
+    for index, document in enumerate(documents, start=1):
+        source = document.metadata.get("source", "unknown")
+        content = document.page_content.strip()
+
+        results.append(
+            f"[문서 {index}] source: {source}\n{content}"
+        )
+    return "\n\n".join(results)
+
+
 @app.get("/api/health")
 async def health():
     return {
@@ -150,18 +279,21 @@ async def chat(req: ChatRequest):
     try:
         diagnosis_type = network_diagnosis_tool.invoke({"question": req.question})
         recommended_commands = command_recommendation_tool.invoke({"problem_type": diagnosis_type})
+        rag_result = rag_search_tool.invoke({"question": req.question})
         messages = [
             SystemMessage(
                 content=(
                     "당신은 네트워크 트러블슈팅을 도와주는 AI Assistant입니다. "
                     "사용자의 네트워크 장애 상황을 듣고 가능한 원인과 다음 확인 단계를 "
                     "쉽고 간단하게 설명하세요. "
-                    "아직 LangGraph, RAG, Memory는 연결되지 않았으므로 "
-                    "기본적인 진단 답변만 제공합니다.\n\n"
+                    "아직 LangGraph, Memory는 연결되지 않았으므로 "
+                    "기본적인 진단 답변과 RAG 검색 결과를 함께 활용합니다.\n\n"
                     f"Network Diagnosis Tool이 분류한 장애 유형은 다음과 같습니다: {diagnosis_type}\n"
                     "반드시 problem_type에는 위 장애 유형을 그대로 사용하세요.\n\n"
                     f"Command Recommendation Tool이 추천한 명령어는 다음과 같습니다: {recommended_commands}\n"
                     "반드시 recommended_commands에는 위 명령어 목록을 그대로 사용하세요.\n\n"
+                    f"RAG Search Tool이 검색한 문서 내용은 다음과 같습니다:\n{rag_result}\n\n"
+                    "가능한 원인과 다음 확인 단계는 위 RAG 검색 결과를 참고해서 작성하세요.\n\n"
                     "응답은 반드시 아래 형식 지침을 따르세요.\n"
                     f"{parser.get_format_instructions()}\n\n"
                     "주의사항:\n"
@@ -204,6 +336,8 @@ async def chat(req: ChatRequest):
             "structured_result": parsed_result.model_dump(),
             "diagnosis_tool_result": diagnosis_type,
             "command_tool_result": recommended_commands,
+            "rag_result": rag_result,
+            "rag_document_count": rag_document_count,
             "model": "gpt-4o-mini",
         }
     
