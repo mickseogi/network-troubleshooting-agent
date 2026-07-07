@@ -1,7 +1,7 @@
 import os
 import math
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, TypedDict
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -13,6 +13,7 @@ from langchain_core.tools import tool
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langgraph.graph import START, END, StateGraph
 
 
 load_dotenv()
@@ -267,6 +268,171 @@ def rag_search_tool(question: str) -> str:
     return "\n\n".join(results)
 
 
+class AgentState(TypedDict):
+    question: str
+    problem_type: str
+    recommended_commands: List[str]
+    rag_result: str
+    answer: str
+    structured_result: Dict[str, Any]
+    diagnosis_tool_result: str
+    command_tool_result: List[str]
+
+
+def diagnose_node(state: AgentState) -> dict:
+    """
+    사용자 질문을 네트워크 장애 유형으로 분류하는 노드
+    """
+    diagnosis_type = network_diagnosis_tool.invoke(
+        {"question": state["question"]}
+    )
+    return{
+        "problem_type": diagnosis_type,
+        "diagnosis_tool_result": diagnosis_type,
+    }
+
+
+def route_by_problem_type(state: AgentState) -> str:
+    """
+    장애 유형에 따라 다음 노드를 결정하는 조건부 분기 함수
+    """
+    if state["problem_type"] == "UNKNOWN_NETWORK_ISSUE":
+        return "clarification"
+    return "known_problem"
+
+
+def rag_node(state: AgentState) -> dict:
+    """
+    사용자 질문과 관련된 RAG 문서를 검색하는 노드
+    """
+    rag_result = rag_search_tool.invoke(
+        {"question": state["question"]}
+    )
+    return{
+        "rag_result": rag_result,
+    }
+
+
+def command_node(state: AgentState) -> dict:
+    """
+    장애 유형에 따라 점검 명령어를 추천하는 노드
+    """
+    recommended_commands = command_recommendation_tool.invoke(
+        {"problem_type": state["problem_type"]}
+    )
+    return{
+        "recommended_commands": recommended_commands,
+        "command_tool_result": recommended_commands,
+    }
+
+
+async def generate_answer_node(state: AgentState) -> dict:
+    """
+    진단 결과, RAG 검색 결과, 추천 명령어를 바탕으로 최종 답변을 생성하는 노드
+    """
+    messages = [
+        SystemMessage(
+            content=(
+                "당신은 네트워크 트러블슈팅을 도와주는 AI Assistant입니다. "
+                "사용자의 네트워크 장애 상황을 듣고 가능한 원인과 다음 확인 단계를 "
+                "쉽고 간단하게 설명하세요. "
+                "아직 Memory는 연결되지 않았으므로 "
+                "LangGraph 기반 진단 흐름과 RAG 검색 결과를 함께 활용합니다.\n\n"
+                f"Network Diagnosis Tool이 분류한 장애 유형은 다음과 같습니다: {state['problem_type']}\n"
+                "반드시 problem_type에는 위 장애 유형을 그대로 사용하세요.\n\n"
+                f"Command Recommendation Tool이 추천한 명령어는 다음과 같습니다: {state['recommended_commands']}\n"
+                "반드시 recommended_commands에는 위 명령어 목록을 그대로 사용하세요.\n\n"
+                f"RAG Search Tool이 검색한 문서 내용은 다음과 같습니다:\n{state['rag_result']}\n\n"
+                "가능한 원인과 다음 확인 단계는 위 RAG 검색 결과를 참고해서 작성하세요.\n\n"
+                "응답은 반드시 아래 형식 지침을 따르세요.\n"
+                f"{parser.get_format_instructions()}\n\n"
+                "주의사항:\n"
+                "- 반드시 JSON 형식으로만 답변하세요.\n"
+                "- 마크다운 코드블록은 사용하지 마세요.\n"
+                "- recommended_commands에는 실제 점검에 사용할 수 있는 명령어를 넣으세요.\n"
+                "- next_question에는 추가 진단을 위해 사용자에게 물어볼 질문을 넣으세요.\n"
+            )
+        ),
+        HumanMessage(content=state["question"]),
+    ]
+
+    response = await llm.ainvoke(messages)
+
+    parsed_result = parser.parse(response.content)
+    parsed_result.problem_type = state["problem_type"]
+    parsed_result.recommended_commands = state["recommended_commands"]
+
+    answer = (
+        f"진단 유형은 {parsed_result.problem_type}입니다. "
+        f"가능한 원인은 {', '.join(parsed_result.possible_causes)}입니다. "
+        f"먼저 {', '.join(parsed_result.recommended_commands)} 명령어를 확인해보세요. "
+        f"추가로 확인할 점은 다음과 같습니다: {parsed_result.next_question}"
+    )
+    return {
+        "answer": answer,
+        "structured_result": parsed_result.model_dump(),
+    }
+
+
+def clarification_node(state: AgentState) -> dict:
+    """
+    장애 유형을 판단하기 어려운 경우 추가 정보를 요청하는 노드
+    """
+    recommended_commands = command_recommendation_tool.invoke(
+        {"problem_type": "UNKNOWN_NETWORK_ISSUE"}
+    )
+
+    structured_result = DiagnosisResult(
+        problem_type="UNKNOWN_NETWORK_ISSUE",
+        possible_causes=[
+            "질문 정보가 부족하여 원인을 특정할 수 없습니다."
+        ],
+        recommended_commands = recommended_commands,
+        next_question = "구체적인 증상, 오류 메시지, 사용 중인 OS, 네트워크 연결 상황을 알려주세요."
+    )
+
+    answer = (
+        "현재 질문만으로는 정확한 네트워크 장애 유형을 판단하기 어렵습니다. "
+        "어떤 상황에서 문제가 발생하는지 조금 더 구체적으로 알려주세요. "
+        f"추가로 확인할 점은 다음과 같습니다: {structured_result.next_question}"
+    )
+
+    return{
+        "problem_type": "UNKNOWN_NETWORK_ISSUE",
+        "recommended_commands": recommended_commands,
+        "command_tool_result": recommended_commands,
+        "rag_result": "",
+        "answer": answer,
+        "structured_result": structured_result.model_dump(),
+    }
+
+workflow = StateGraph(AgentState)
+
+workflow.add_node("diagnose_node", diagnose_node)
+workflow.add_node("rag_node", rag_node)
+workflow.add_node("command_node", command_node)
+workflow.add_node("generate_answer_node", generate_answer_node)
+workflow.add_node("clarification_node", clarification_node)
+
+workflow.add_edge(START, "diagnose_node")
+
+workflow.add_conditional_edges(
+    "diagnose_node",
+    route_by_problem_type,
+    {
+        "known_problem": "rag_node",
+        "clarification": "clarification_node"
+    },
+)
+
+workflow.add_edge("rag_node", "command_node")
+workflow.add_edge("command_node", "generate_answer_node")
+workflow.add_edge("generate_answer_node", END)
+workflow.add_edge("clarification_node", END)
+
+agent_graph = workflow.compile()
+
+
 @app.get("/api/health")
 async def health():
     return {
@@ -277,69 +443,39 @@ async def health():
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     try:
-        diagnosis_type = network_diagnosis_tool.invoke({"question": req.question})
-        recommended_commands = command_recommendation_tool.invoke({"problem_type": diagnosis_type})
-        rag_result = rag_search_tool.invoke({"question": req.question})
-        messages = [
-            SystemMessage(
-                content=(
-                    "당신은 네트워크 트러블슈팅을 도와주는 AI Assistant입니다. "
-                    "사용자의 네트워크 장애 상황을 듣고 가능한 원인과 다음 확인 단계를 "
-                    "쉽고 간단하게 설명하세요. "
-                    "아직 LangGraph, Memory는 연결되지 않았으므로 "
-                    "기본적인 진단 답변과 RAG 검색 결과를 함께 활용합니다.\n\n"
-                    f"Network Diagnosis Tool이 분류한 장애 유형은 다음과 같습니다: {diagnosis_type}\n"
-                    "반드시 problem_type에는 위 장애 유형을 그대로 사용하세요.\n\n"
-                    f"Command Recommendation Tool이 추천한 명령어는 다음과 같습니다: {recommended_commands}\n"
-                    "반드시 recommended_commands에는 위 명령어 목록을 그대로 사용하세요.\n\n"
-                    f"RAG Search Tool이 검색한 문서 내용은 다음과 같습니다:\n{rag_result}\n\n"
-                    "가능한 원인과 다음 확인 단계는 위 RAG 검색 결과를 참고해서 작성하세요.\n\n"
-                    "응답은 반드시 아래 형식 지침을 따르세요.\n"
-                    f"{parser.get_format_instructions()}\n\n"
-                    "주의사항:\n"
-                    "- 반드시 JSON 형식으로만 답변하세요.\n"
-                    "- 마크다운 코드블록은 사용하지 마세요.\n"
-                    "- recommended_commands에는 실제 점검에 사용할 수 있는 명령어를 넣으세요.\n"
-                    "- next_question에는 추가 진단을 위해 사용자에게 물어볼 질문을 넣으세요.\n"
-                    "- problem_type이 UNKNOWN_NETWORK_ISSUE인 경우, 원인을 단정하지 말고 정보가 부족하다고 설명하세요.\n"
-                    "- problem_type이 UNKNOWN_NETWORK_ISSUE인 경우, next_question에는 구체적인 증상, 오류 메시지, OS, 네트워크 상황을 물어보세요.\n"
-                    "- problem_type이 UNKNOWN_NETWORK_ISSUE인 경우, possible_causes는 추측하지 말고 정보 부족으로 작성하세요.\n"
-                    "- problem_type이 UNKNOWN_NETWORK_ISSUE인 경우, recommended_commands는 최소화하고 next_question을 중심으로 작성하세요.\n"
-                )
-            ),
-            HumanMessage(content=req.question),
-        ]
-        response = await llm.ainvoke(messages)
-
-        parsed_result = parser.parse(response.content)
-        parsed_result.problem_type = diagnosis_type
-        parsed_result.recommended_commands = recommended_commands
-
-        if parsed_result.problem_type == "UNKNOWN_NETWORK_ISSUE":
-            answer = (
-                "현재 질문만으로는 정확한 네트워크 장애 유형을 판단하기 어렵습니다. "
-                "어떤 상황에서 문제가 발생하는지 조금 더 구체적으로 알려주세요. "
-                f"추가로 확인할 점은 다음과 같습니다: {parsed_result.next_question}"
-            )
-        else:
-            answer = (
-                f"진단 유형은 {parsed_result.problem_type}입니다. "
-                f"가능한 원인은 {', '.join(parsed_result.possible_causes)}입니다. "
-                f"먼저 {', '.join(parsed_result.recommended_commands)} 명령어를 확인해보세요. "
-                f"추가로 확인할 점은 다음과 같습니다: {parsed_result.next_question}"
-            )
-
+        final_state = await agent_graph.ainvoke(
+            {
+                "question": req.question,
+            }
+        )
         return{
             "success": True,
             "question": req.question,
-            "answer": answer,
-            "structured_result": parsed_result.model_dump(),
-            "diagnosis_tool_result": diagnosis_type,
-            "command_tool_result": recommended_commands,
-            "rag_result": rag_result,
+            "answer": final_state.get("answer", ""),
+            "structured_result": final_state.get("structured_result", {}),
+            "diagnosis_tool_result": final_state.get(
+                "diagnosis_tool_result",
+                final_state.get("problem_type", "UNKNOWN_NETWORK_ISSUE"),
+            ),
+            "command_tool_result": final_state.get(
+                "command_tool_result",
+                final_state.get("recommended_commands", []),
+            ),
+            "rag_result": final_state.get("rag_result", ""),
             "rag_document_count": rag_document_count,
+            "graph_used": True,
+            "graph_flow": [
+                "START",
+                "diagnose_node",
+                "conditional_edge",
+                "rag_node or clarification_node",
+                "command_node",
+                "generate_answer_node",
+                "END",
+            ],
             "model": "gpt-4o-mini",
         }
+        
     
     except Exception as e:
         return {
