@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
@@ -28,10 +30,20 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 diagnosis_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
 DOCS_DIR = Path("docs")
+PUBLIC_DIR = Path("public")
 
 class ChatRequest(BaseModel):
-    question: str
-    session_id: str = "default"
+    question: str = Field(
+        min_length=1,
+        max_length=500,
+        description="사용자 네트워크 장애 질문",
+    )
+    session_id: str = Field(
+        default="default",
+        min_length=1,
+        max_length=40,
+        description="대화 세션 ID",
+    )
 
 
 class DiagnosisResult(BaseModel):
@@ -843,7 +855,7 @@ async def chat(req: ChatRequest):
 
 
 class ResetMemoryRequest(BaseModel):
-    session_id: str = "default"
+    session_id: str = Field(default="default", min_length=1, max_length=40)
 
 @app.post("/api/memory/reset")
 async def reset_memory(req: ResetMemoryRequest):
@@ -855,8 +867,21 @@ async def reset_memory(req: ResetMemoryRequest):
     }
 
 
+@app.get("/api/memory/history")
+async def get_memory_history_api(
+    session_id: str = Query(default="default"),
+):
+    history = get_memory_history(session_id)
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "chat_history": messages_to_json(history.messages),
+    }
+
+
 class ResetMiddlewareRequest(BaseModel):
-    session_id: str = "default"
+    session_id: str = Field(default="default", min_length=1, max_length=40)
 
 
 @app.get("/api/middleware/logs")
@@ -890,7 +915,7 @@ async def reset_middleware(req: ResetMiddlewareRequest):
 
 
 class MiddlewareConfigRequest(BaseModel):
-    session_id: str = "default"
+    session_id: str = Field(default="default", min_length=1, max_length=40)
     model_call_limit: Optional[int] = None
     tool_call_limit: Optional[int] = None
     log_retention: Optional[int] = None
@@ -915,3 +940,14 @@ async def update_middleware_config(req: MiddlewareConfigRequest):
         "session_id": req.session_id,
         "config": session["config"],
     }
+
+
+app.mount(
+    "/public",
+    StaticFiles(directory=PUBLIC_DIR, check_dir=False),
+    name="public",
+)
+
+@app.get("/")
+async def index():
+    return FileResponse(PUBLIC_DIR / "index.html")

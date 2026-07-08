@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>Network Troubleshooting Chat Agent</title>
+
+  <link rel="stylesheet" href="/public/css/style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <nav class="navbar">
+      <div class="nav-brand">
+        <div class="brand-mark">N</div>
+        <div>
+          <strong>Network Troubleshooting Agent</strong>
+          <span>LangGraph · RAG · Memory · Middleware</span>
+        </div>
+      </div>
+
+      <div class="nav-links">
+        <a href="#chat">Chat</a>
+        <a href="#diagnosis">Diagnosis</a>
+        <a href="#trace">Trace</a>
+        <a href="#evidence">Evidence</a>
+      </div>
+    </nav>
+
+    <main>
+      <section id="chat" class="chatbot-section">
+        <div class="chatbot-header">
+          <p class="eyebrow">AI Network Assistant</p>
+          <h1>네트워크 장애를 대화로 진단하세요.</h1>
+          <p>
+            SSH, DHCP, DNS, Gateway, Firewall 문제를 자연어로 입력하면
+            Agent가 원인 후보, 점검 명령어, RAG 근거, 실행 흐름을 함께 보여줍니다.
+          </p>
+        </div>
+
+        <section class="chatbot-card">
+          <div class="chatbot-topbar">
+            <div>
+              <strong>Agent Chat</strong>
+              <span>LangGraph-powered troubleshooting console</span>
+            </div>
+
+            <span id="status-pill" class="status-pill idle">Idle</span>
+          </div>
+
+          <div id="chat-messages" class="chat-messages">
+            <div class="chat-message assistant">
+              <div class="avatar">AI</div>
+                <div class="bubble compact-bubble">
+                  안녕하세요. 네트워크 장애 상황을 알려주세요.
+                </div>
+            </div>
+          </div>
+
+          <form id="chat-form" class="chat-input-area">
+            <textarea
+              id="question-input"
+              rows="2"
+              maxlength="500"
+              placeholder="네트워크 장애 상황을 입력하세요..."
+              required
+            ></textarea>
+
+            <button id="send-btn" class="primary-button" type="submit">
+              Run Agent
+            </button>
+          </form>
+        </section>
+
+        <div class="chat-control-row">
+          <label class="session-field">
+            <span>Session ID</span>
+            <input
+              id="session-id"
+              type="text"
+              value="default"
+              maxlength="40"
+              autocomplete="off"
+            />
+          </label>
+
+          <button id="load-session-btn" class="ghost-button" type="button">
+            Load Session
+          </button>
+
+          <button id="memory-reset-btn" class="ghost-button" type="button">
+            Reset Memory
+          </button>
+
+          <button id="middleware-reset-btn" class="ghost-button" type="button">
+            Reset Logs
+          </button>
+        </div>
+
+        <div class="sample-list">
+          <button type="button" class="sample-btn">SSH 접속이 안 돼요</button>
+          <button type="button" class="sample-btn">ping은 되는데 특정 포트 접속이 안 돼요</button>
+          <button type="button" class="sample-btn">IP로는 되는데 도메인으로는 접속이 안 돼요</button>
+          <button type="button" class="sample-btn">IP를 자동으로 못 받아와요</button>
+          <button type="button" class="sample-btn">게이트웨이는 잡혀 있는데 인터넷이 안 돼요</button>
+        </div>
+      </section>
+
+      <section id="diagnosis" class="section">
+        <div class="section-header">
+          <p class="eyebrow">Diagnosis Summary</p>
+          <h2>Agent 진단 요약</h2>
+        </div>
+
+        <div class="summary-grid">
+          <article class="summary-card">
+            <span>Problem Type</span>
+            <strong id="problem-type">-</strong>
+          </article>
+
+          <article class="summary-card">
+            <span>Memory Saved</span>
+            <strong id="memory-saved">-</strong>
+          </article>
+
+          <article class="summary-card">
+            <span>Model Calls</span>
+            <strong id="model-count">-</strong>
+          </article>
+
+          <article class="summary-card">
+            <span>Tool Calls</span>
+            <strong id="tool-count">-</strong>
+          </article>
+
+          <article class="summary-card">
+            <span>RAG Docs</span>
+            <strong id="rag-doc-count">-</strong>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <p class="eyebrow">Structured Output</p>
+          <h2>구조화된 진단 결과</h2>
+        </div>
+
+        <div class="result-grid">
+          <article class="panel result-card">
+            <h3>Possible Causes</h3>
+            <ul id="possible-causes" class="cause-list">
+              <li>아직 결과가 없습니다.</li>
+            </ul>
+          </article>
+
+          <article class="panel result-card">
+            <h3>Recommended Commands</h3>
+            <div id="recommended-commands" class="command-list">
+              <code>$ waiting for agent...</code>
+            </div>
+          </article>
+
+          <article class="panel result-card">
+            <h3>Next Question</h3>
+            <p id="next-question" class="next-question">
+              아직 결과가 없습니다.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section id="trace" class="section">
+        <div class="section-header">
+          <p class="eyebrow">Agent Trace</p>
+          <h2>Agent가 실행한 진단 흐름</h2>
+        </div>
+
+        <div class="panel trace-panel">
+          <div id="graph-flow" class="flow-list">
+            <span class="flow-chip muted">START</span>
+            <span class="flow-arrow">→</span>
+            <span class="flow-chip muted">Waiting</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="evidence" class="section">
+        <div class="section-header">
+          <p class="eyebrow">Evidence Panel</p>
+          <h2>답변 근거와 실행 로그</h2>
+        </div>
+
+        <div class="tabs">
+          <button class="tab-button active" data-tab="rag">RAG Evidence</button>
+          <button class="tab-button" data-tab="middleware">Middleware Logs</button>
+          <button class="tab-button" data-tab="history">Chat History</button>
+        </div>
+
+        <div class="panel tab-panel active" id="tab-rag">
+          <div id="rag-result" class="evidence-box">
+            아직 검색 결과가 없습니다.
+          </div>
+        </div>
+
+        <div class="panel tab-panel" id="tab-middleware">
+          <div id="middleware-logs" class="log-list">
+            아직 middleware 로그가 없습니다.
+          </div>
+        </div>
+
+        <div class="panel tab-panel" id="tab-history">
+          <div id="chat-history" class="history-list">
+            아직 대화 이력이 없습니다.
+          </div>
+        </div>
+      </section>
+
+      <section id="architecture" class="section architecture-section">
+        <div class="section-header">
+          <p class="eyebrow">Architecture</p>
+          <h2>Agent 내부 구조</h2>
+          <p>
+            프론트엔드는 FastAPI와 통신하고, 백엔드는 LangGraph StateGraph를 통해
+            Tool, RAG, Memory, Middleware, OutputParser를 연결합니다.
+          </p>
+        </div>
+
+        <div class="architecture-grid">
+          <article class="arch-card">
+            <span>01</span>
+            <h3>LangGraph</h3>
+            <p>StateGraph와 conditional edge로 진단 흐름을 분기합니다.</p>
+          </article>
+
+          <article class="arch-card">
+            <span>02</span>
+            <h3>Tools</h3>
+            <p>장애 유형 분류, RAG 검색, 명령어 추천 Tool을 실행합니다.</p>
+          </article>
+
+          <article class="arch-card">
+            <span>03</span>
+            <h3>RAG</h3>
+            <p>Markdown 기반 네트워크 트러블슈팅 문서를 검색합니다.</p>
+          </article>
+
+          <article class="arch-card">
+            <span>04</span>
+            <h3>Memory</h3>
+            <p>세션별 대화 이력을 유지해 후속 질문을 처리합니다.</p>
+          </article>
+
+          <article class="arch-card">
+            <span>05</span>
+            <h3>Middleware</h3>
+            <p>Tool 호출, LLM 호출, 에러, 실행 완료 로그를 기록합니다.</p>
+          </article>
+
+          <article class="arch-card">
+            <span>06</span>
+            <h3>OutputParser</h3>
+            <p>Pydantic 구조로 진단 결과를 JSON 형태로 반환합니다.</p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>Network Troubleshooting Agent · AI Service Design Project</p>
+    </footer>
+  </div>
+
+  <script type="module" src="/public/js/main.js"></script>
+</body>
+</html>
