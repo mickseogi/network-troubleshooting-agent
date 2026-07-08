@@ -274,6 +274,73 @@ PROBLEM_TYPES = [
     "UNKNOWN_NETWORK_ISSUE",
 ]
 
+INPUT_GUARD_TYPES = [     #bug_fix(#19): 일단은 일관되지 않은 버그 발생이니, 기존 코드에서 진단 전에 의미 없는 입력이 known_problem으로 가는걸 막는 방향으로 구현할 예정 
+    "VALID_INPUT",
+    "OUT_OF_SCOPE",
+    "INVALID_INPUT",
+]
+
+
+def is_repeated_mieum_input(question: str) -> bool:
+    """
+    ㅁ 문자가 비정상적으로 많이 반복된 입력을 감지한다.
+    """
+    compact_text = "".join(question.strip().split())
+
+    if len(compact_text) < 30:
+        return False
+
+    mieum_count = compact_text.count("ㅁ")
+
+    return mieum_count / len(compact_text) >= 0.8
+
+
+def classify_current_input(question: str) -> str:
+    """
+    현재 질문만 보고 Agent 진단을 진행해도 되는 입력인지 판단한다.
+    Memory context는 사용하지 않는다.
+    """
+    if is_repeated_mieum_input(question):
+        return "INVALID_INPUT"
+
+    messages = [
+        SystemMessage(
+            content=(
+                "당신은 네트워크 트러블슈팅 Agent의 입력 검증 도구입니다. "
+                "현재 사용자 입력만 보고 아래 세 가지 중 하나로 분류하세요.\n\n"
+                "분류 기준:\n"
+                "- VALID_INPUT: 네트워크 장애 질문이거나, 네트워크 장애 대화에서 이어질 수 있는 후속 응답입니다.\n"
+                "  예: SSH 접속이 안 돼요, ping은 돼요, 방화벽 문제일까요, 여전히 안 됩니다, 그건 됩니다\n"
+                "- OUT_OF_SCOPE: 네트워크 장애와 무관한 일반 대화입니다.\n"
+                "  예: 배고파요, 오늘 뭐 먹지, 날씨 어때\n"
+                "- INVALID_INPUT: 의미 없는 반복 문자, 무작위 입력, 해석 불가능한 문자열입니다.\n"
+                "  예: ㅁㅁㅁㅁㅁㅁㅁㅁㅁ, asdfasdfasdfasdf\n\n"
+                "중요 규칙:\n"
+                "- 이전 대화 문맥은 고려하지 마세요.\n"
+                "- 현재 입력만 보고 판단하세요.\n"
+                "- 반드시 아래 목록 중 하나만 출력하세요.\n"
+                "- 설명 문장은 쓰지 마세요.\n\n"
+                f"선택 가능한 유형: {INPUT_GUARD_TYPES}"
+            )
+        ),
+        HumanMessage(content=question),
+    ]
+
+    response = diagnosis_llm.invoke(messages)
+
+    result = (
+        response.content
+        .strip()
+        .replace("`", "")
+        .replace('"', "")
+        .replace("'", "")
+    )
+
+    for guard_type in INPUT_GUARD_TYPES:
+        if guard_type in result:
+            return guard_type
+
+    return "OUT_OF_SCOPE"
 
 class SimpleVectorStore:
     def __init__(self):
@@ -509,6 +576,8 @@ class AgentState(TypedDict, total=False):
     structured_result: Dict[str, Any]
     diagnosis_tool_result: str
     command_tool_result: List[str]
+    input_guard_result: str
+    input_status: str
 
 
 def append_graph_flow(state: AgentState, node_name: str) -> List[str]:
@@ -534,6 +603,73 @@ def memory_node(state: AgentState) -> dict:
         "graph_flow": append_graph_flow(state, "memory_node"),
     }
 
+
+def input_guard_node(state: AgentState) -> dict:   #19 버그해결 로직
+    """
+    현재 질문이 Agent 진단에 적합한 입력인지 먼저 검사하는 노드
+    Memory context는 사용 안 함
+    """
+    session_id = state.get("session_id", "default")
+
+    # 명확한 ㅁ 반복 입력은 LLM 호출 없이 바로 차단
+    if is_repeated_mieum_input(state["question"]):
+        input_status = "INVALID_INPUT"
+    else:
+        model_call_limit_middleware(
+            session_id=session_id,
+            purpose="current input guard validation",
+        )
+
+        input_status = classify_current_input(state["question"])
+
+    return {
+        "input_status": input_status,
+        "input_guard_result": input_status,
+        "graph_flow": append_graph_flow(state, "input_guard_node"),
+    }
+
+
+def route_by_input_status(state: AgentState) -> str:
+    """
+    입력 검증 결과에 따라 다음 노드를 결정
+    """
+    if state["input_status"] == "INVALID_INPUT":
+        return "invalid_input"
+
+    if state["input_status"] == "OUT_OF_SCOPE":
+        return "out_of_scope"
+
+    return "valid_input"
+
+
+def invalid_input_node(state: AgentState) -> dict:
+    """
+    의미 없는 입력인 경우 Agent 진단을 실행하지 않고 안내 메시지를 반환
+    """
+    structured_result = DiagnosisResult(
+        problem_type="UNKNOWN_NETWORK_ISSUE",
+        possible_causes=[
+            "의미 없는 반복 입력 또는 해석하기 어려운 문자열입니다."
+        ],
+        recommended_commands=[],
+        next_question="네트워크 장애 상황을 구체적인 문장으로 입력해주세요.",
+    )
+
+    answer = (
+        "입력이 의미 없는 반복 문자열로 보여 네트워크 진단을 실행하지 않았습니다. "
+        "SSH, DNS, DHCP, Gateway, Firewall 등 어떤 문제가 발생했는지 문장으로 입력해주세요."
+    )
+
+    return {
+        "problem_type": "UNKNOWN_NETWORK_ISSUE",
+        "recommended_commands": [],
+        "command_tool_result": [],
+        "rag_result": "",
+        "answer": answer,
+        "structured_result": structured_result.model_dump(),
+        "should_save_memory": False,
+        "graph_flow": append_graph_flow(state, "conditional_edge:invalid_input") + ["invalid_input_node"],
+    }
 
 
 def diagnose_node(state: AgentState) -> dict:
@@ -756,15 +892,27 @@ def save_memory_node(state: AgentState) -> dict:
 workflow = StateGraph(AgentState)
 
 workflow.add_node("memory_node", memory_node)
+workflow.add_node("input_guard_node", input_guard_node)
 workflow.add_node("diagnose_node", diagnose_node)
 workflow.add_node("rag_node", rag_node)
 workflow.add_node("command_node", command_node)
 workflow.add_node("generate_answer_node", generate_answer_node)
 workflow.add_node("clarification_node", clarification_node)
+workflow.add_node("invalid_input_node", invalid_input_node)
 workflow.add_node("save_memory_node", save_memory_node)
 
 workflow.add_edge(START, "memory_node")
-workflow.add_edge("memory_node", "diagnose_node")
+workflow.add_edge("memory_node", "input_guard_node")
+
+workflow.add_conditional_edges( #19 버그해결
+    "input_guard_node",
+    route_by_input_status,
+    {
+        "valid_input": "diagnose_node",
+        "out_of_scope": "clarification_node",
+        "invalid_input": "invalid_input_node",
+    },
+)
 
 workflow.add_conditional_edges(
     "diagnose_node",
@@ -779,6 +927,7 @@ workflow.add_edge("rag_node", "command_node")
 workflow.add_edge("command_node", "generate_answer_node")
 workflow.add_edge("generate_answer_node", "save_memory_node")
 workflow.add_edge("clarification_node", "save_memory_node")
+workflow.add_edge("invalid_input_node", "save_memory_node")
 workflow.add_edge("save_memory_node", END)
 
 agent_graph = workflow.compile()

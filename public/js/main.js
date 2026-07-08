@@ -46,6 +46,18 @@ function loadLastSessionId() {
   }
 }
 
+function isRepeatedMieumInput(question) {
+  const compactText = question.trim().replace(/\s/g, "");
+
+  if (compactText.length < 30) {
+    return false;
+  }
+
+  const mieumCount = [...compactText].filter((char) => char === "ㅁ").length;
+
+  return mieumCount / compactText.length >= 0.8;
+}
+
 async function loadSession(sessionId = getSessionId()) {
   sessionInput.value = sessionId;
   saveLastSession(sessionId);
@@ -87,6 +99,14 @@ async function handleSubmit(event) {
   if (!question) {
     addAssistantMessage("질문을 입력해주세요.");
     setStatus("error", "Error");
+    return;
+  }
+
+  if (isRepeatedMieumInput(question)) {
+    addAssistantMessage(
+      "의미 없는 반복 입력으로 보여 진단을 실행하지 않았습니다. 네트워크 장애 상황을 문장으로 입력해주세요."
+    );
+    setStatus("error", "Invalid Input");
     return;
   }
 
