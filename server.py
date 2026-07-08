@@ -51,6 +51,7 @@ class DiagnosisResult(BaseModel):
     possible_causes: List[str] = Field(description="가능한 원인 후보 목록")
     recommended_commands: List[str] = Field(description="사용자가 확인할 수 있는 점검 명령어 목록")
     next_question: str = Field(description="추가 진단을 위해 사용자에게 물어볼 다음 질문")
+    user_facing_answer: str = Field(description="사용자에게 보여줄 자연스러운 최종 답변")
 
 parser = PydanticOutputParser(pydantic_object=DiagnosisResult)
 
@@ -71,9 +72,9 @@ def get_middleware_session(session_id: str) -> dict[str, Any]:
             "model_call_count": 0,
             "tool_call_count": 0,
             "config": {
-                "model_call_limit": 20,
-                "tool_call_limit": 50,
-                "log_retention": 50,
+                "model_call_limit": 100,
+                "tool_call_limit": 200,
+                "log_retention": 100,
             },
         }
     
@@ -132,7 +133,7 @@ def request_logging_middleware(session_id: str, question: str) -> None:
 
 def model_call_limit_middleware(session_id: str, purpose: str) -> None:
     """
-    LLM 호풀 횟수를 기록하고 계산
+    LLM 호출 횟수를 기록하고 계산
     """
     session = get_middleware_session(session_id)
     session["model_call_count"] += 1
@@ -276,14 +277,14 @@ PROBLEM_TYPES = [
 
 INPUT_GUARD_TYPES = [     #bug_fix(#19): 일단은 일관되지 않은 버그 발생이니, 기존 코드에서 진단 전에 의미 없는 입력이 known_problem으로 가는걸 막는 방향으로 구현할 예정 
     "VALID_INPUT",
-    "OUT_OF_SCOPE",
+    "GENERAL_CHAT",
     "INVALID_INPUT",
 ]
 
 
 def is_repeated_mieum_input(question: str) -> bool:
     """
-    ㅁ 문자가 비정상적으로 많이 반복된 입력을 감지한다.
+    비정상적인 입력을 감지
     """
     compact_text = "".join(question.strip().split())
 
@@ -297,8 +298,8 @@ def is_repeated_mieum_input(question: str) -> bool:
 
 def classify_current_input(question: str) -> str:
     """
-    현재 질문만 보고 Agent 진단을 진행해도 되는 입력인지 판단한다.
-    Memory context는 사용하지 않는다.
+    현재 질문만 보고 Agent 진단을 진행해도 되는 입력인지 판단
+    Memory context는 사용안함
     """
     if is_repeated_mieum_input(question):
         return "INVALID_INPUT"
@@ -306,21 +307,34 @@ def classify_current_input(question: str) -> str:
     messages = [
         SystemMessage(
             content=(
-                "당신은 네트워크 트러블슈팅 Agent의 입력 검증 도구입니다. "
+                "당신은 네트워크 트러블슈팅 Agent의 입력 라우팅 도구입니다. "
                 "현재 사용자 입력만 보고 아래 세 가지 중 하나로 분류하세요.\n\n"
                 "분류 기준:\n"
                 "- VALID_INPUT: 네트워크 장애 질문이거나, 네트워크 장애 대화에서 이어질 수 있는 후속 응답입니다.\n"
-                "  예: SSH 접속이 안 돼요, ping은 돼요, 방화벽 문제일까요, 여전히 안 됩니다, 그건 됩니다\n"
-                "- OUT_OF_SCOPE: 네트워크 장애와 무관한 일반 대화입니다.\n"
-                "  예: 배고파요, 오늘 뭐 먹지, 날씨 어때\n"
+                "  예: SSH 접속이 안 돼요, ping은 돼요, 방화벽 문제일까요, 여전히 안 됩니다, 그건 됩니다, Docker 컨테이너에서 인터넷이 안 돼요\n"
+                "- GENERAL_CHAT: 네트워크 진단을 실행할 필요가 없는 일반 대화입니다.\n"
+                "  예: 고마워, 해결됐어, 너 뭐 할 수 있어, 이 프로젝트 뭐야, 안녕\n"
                 "- INVALID_INPUT: 의미 없는 반복 문자, 무작위 입력, 해석 불가능한 문자열입니다.\n"
                 "  예: ㅁㅁㅁㅁㅁㅁㅁㅁㅁ, asdfasdfasdfasdf\n\n"
                 "중요 규칙:\n"
                 "- 이전 대화 문맥은 고려하지 마세요.\n"
                 "- 현재 입력만 보고 판단하세요.\n"
+                "- 사용자가 감사, 인사, 기능 질문을 하면 GENERAL_CHAT으로 분류하세요.\n"
+                "- 네트워크 문제처럼 보이지만 준비된 유형에 딱 맞지 않아도 VALID_INPUT으로 분류하세요.\n"
                 "- 반드시 아래 목록 중 하나만 출력하세요.\n"
                 "- 설명 문장은 쓰지 마세요.\n\n"
-                f"선택 가능한 유형: {INPUT_GUARD_TYPES}"
+                f"선택 가능한 유형: {INPUT_GUARD_TYPES}\n\n"
+                "- 네트워크 키워드가 포함되어 있어도, 사용자의 실제 의도가 음식, 잡담, 감사, 인사, 일반 대화라면 GENERAL_CHAT으로 분류하세요.\n"
+                "- 'DNS는 해결했는데 라면 먹고 싶다', 'SSH는 됐고 이제 밥 먹자'처럼 네트워크 문제 종료 후 다른 주제로 넘어가면 GENERAL_CHAT입니다.\n"
+                "- 반대로 'DNS 서버 주소는 어디서 확인해요?', '그 명령어 결과는 어떻게 해석해요?', '포트가 열렸는지 어디서 봐요?'처럼 네트워크 설정 확인 방법이나 결과 해석을 묻는 질문은 VALID_INPUT입니다.\n"
+                "- 짧은 후속 질문이라도 네트워크 점검 방법, 명령어, 설정 위치, 결과 해석을 묻고 있으면 VALID_INPUT입니다.\n"
+                "- VALID_INPUT은 네트워크 장애 대상, 증상, 명령어 결과, 설정 확인 질문, 오류 메시지 중 하나 이상이 포함된 경우에만 선택하세요.\n"
+                "- 네트워크 장애 정보가 없는 짧은 일반 대화, 장난성 문장, 무관한 질문은 VALID_INPUT으로 분류하지 마세요.\n"
+                "- 예: '테스트', '아무 말', '오늘 뭐 먹지', '그냥 해본 말'처럼 네트워크 증상이나 점검 정보가 없으면 GENERAL_CHAT입니다.\n"
+                "- 의미 없는 반복 문자나 해석하기 어려운 문자열은 INVALID_INPUT입니다.\n"
+                "- 단, 표현이 자연스럽지 않더라도 네트워크 장애 대상이나 증상이 포함되어 있으면 VALID_INPUT입니다.\n"
+                "- 예: '도커가 안 됩니다', '인터넷 연결이 안 됩니다', 'SSH 접속이 실패합니다', 'DNS가 동작하지 않습니다'는 VALID_INPUT입니다.\n"
+                "- 네트워크 관련성이 애매하면 VALID_INPUT이 아니라 GENERAL_CHAT으로 분류하세요.\n"
             )
         ),
         HumanMessage(content=question),
@@ -340,7 +354,7 @@ def classify_current_input(question: str) -> str:
         if guard_type in result:
             return guard_type
 
-    return "OUT_OF_SCOPE"
+    return "GENERAL_CHAT"
 
 class SimpleVectorStore:
     def __init__(self):
@@ -633,13 +647,13 @@ def route_by_input_status(state: AgentState) -> str:
     """
     입력 검증 결과에 따라 다음 노드를 결정
     """
+    if state["input_status"] == "VALID_INPUT":
+        return "valid_input"
+
     if state["input_status"] == "INVALID_INPUT":
         return "invalid_input"
 
-    if state["input_status"] == "OUT_OF_SCOPE":
-        return "out_of_scope"
-
-    return "valid_input"
+    return "general_chat"
 
 
 def invalid_input_node(state: AgentState) -> dict:
@@ -653,6 +667,7 @@ def invalid_input_node(state: AgentState) -> dict:
         ],
         recommended_commands=[],
         next_question="네트워크 장애 상황을 구체적인 문장으로 입력해주세요.",
+        user_facing_answer="입력이 의미 없는 반복 문자열로 보여 네트워크 진단을 실행하지 않았습니다.",
     )
 
     answer = (
@@ -669,6 +684,54 @@ def invalid_input_node(state: AgentState) -> dict:
         "structured_result": structured_result.model_dump(),
         "should_save_memory": False,
         "graph_flow": append_graph_flow(state, "conditional_edge:invalid_input") + ["invalid_input_node"],
+    }
+
+
+async def general_chat_node(state: AgentState) -> dict:
+    """
+    네트워크 진단이 필요 없는 일반 대화에 자연스럽게 응답하는 노드
+    """
+    session_id = state.get("session_id", "default")
+
+    model_call_limit_middleware(
+        session_id=session_id,
+        purpose="general chat response generation",
+    )
+
+    messages = [
+        SystemMessage(
+            content=(
+                "당신은 Network Troubleshooting Agent입니다. "
+                "사용자가 일반 대화를 하면 자연스럽게 응답하세요. "
+                "단, 서비스의 중심은 네트워크 트러블슈팅임을 너무 딱딱하지 않게 알려주세요.\n\n"
+                "응답 규칙:\n"
+                "- UNKNOWN_NETWORK_ISSUE 같은 진단 문구를 말하지 마세요.\n"
+                "- 사용자가 감사하면 짧고 자연스럽게 답하세요.\n"
+                "- 사용자가 기능을 물으면 SSH, DNS, DHCP, Gateway, Firewall, Port 문제를 도와줄 수 있다고 설명하세요.\n"
+                "- 네트워크 진단 Tool, RAG, 명령어 추천을 실행한 것처럼 말하지 마세요."
+            )
+        ),
+        HumanMessage(content=state["question"]),
+    ]
+    response = await llm.ainvoke(messages)
+    
+    structured_result = DiagnosisResult(
+        problem_type="GENERAL_CHAT",
+        possible_causes=[],
+        recommended_commands=[],
+        next_question="네트워크 장애 상황이 있다면 증상을 알려주세요.",
+        user_facing_answer=response.content,
+    )
+
+    return{
+        "problem_type": "GENERAL_CHAT",
+        "recommended_commands": [],
+        "command_tool_result": [],
+        "rag_result": "",
+        "answer": response.content,
+        "structured_result": structured_result.model_dump(),
+        "should_save_memory": False,
+        "graph_flow": append_graph_flow(state, "conditional_edge:general_chat") + ["general_chat_node"],
     }
 
 
@@ -710,6 +773,7 @@ def route_by_problem_type(state: AgentState) -> str:
     """
     if state["problem_type"] == "UNKNOWN_NETWORK_ISSUE":
         return "clarification"
+
     return "known_problem"
 
 
@@ -797,6 +861,18 @@ async def generate_answer_node(state: AgentState) -> dict:
                 "- next_question에는 추가 진단을 위해 사용자에게 물어볼 질문을 넣으세요.\n"
                 "- 이전 대화에서 이미 확인된 정보는 다시 묻지 마세요.\n"
                 "- 사용자가 ping이 된다고 말했거나 방화벽 가능성을 물어보면, 서버 IP보다 SSH 서비스 상태, 포트 리스닝 여부, 방화벽 허용 여부를 우선 질문하세요.\n"
+                "- user_facing_answer에는 사용자가 실제로 읽을 자연스러운 답변을 작성하세요.\n"
+                "- user_facing_answer에서는 problem_type을 기계적으로 반복하지 말고, 상황을 해석해서 설명하세요.\n"
+                "- 사용자가 입력한 IP, 포트, OS, 오류 메시지, 이미 확인한 결과가 있다면 답변에 반영하세요.\n"
+                "- 준비된 유형에 딱 맞지 않는 네트워크 문제라도 가능한 확인 순서를 제안하세요.\n"
+                "- 확실하지 않은 원인은 단정하지 말고 가능성으로 표현하세요.\n"
+                "- user_facing_answer 안에도 recommended_commands 중 핵심 명령어 2~4개를 직접 포함하세요.\n"
+                "- '명령어를 추천드립니다'라고만 말하지 말고, 사용자가 바로 실행할 수 있게 명령어를 실제로 적으세요.\n"
+                "- 답변은 상황 해석 → 가능한 원인 → 확인 명령어 → 결과를 알려달라는 요청 순서로 작성하세요.\n"
+                "- 명령어를 나열할 때 각 명령어가 무엇을 확인하는지도 짧게 설명하세요.\n"
+                "- JSON 밖에 일반 문장, 설명, 번호 목록을 절대 쓰지 마세요.\n"
+                "- 응답의 첫 글자는 반드시 { 이고 마지막 글자는 반드시 } 여야 합니다.\n"
+                "- user_facing_answer 안에 자연스러운 설명을 넣고, JSON 바깥에는 아무것도 쓰지 마세요.\n"
             )
         ),
         HumanMessage(content=state["question"]),
@@ -804,16 +880,41 @@ async def generate_answer_node(state: AgentState) -> dict:
 
     response = await llm.ainvoke(messages)
 
-    parsed_result = parser.parse(response.content)
-    parsed_result.problem_type = state["problem_type"]
-    parsed_result.recommended_commands = state["recommended_commands"]
+    try:
+        parsed_result = parser.parse(response.content)
+        parsed_result.problem_type = state["problem_type"]
+        parsed_result.recommended_commands = state["recommended_commands"]
 
-    answer = (
-        f"진단 유형은 {parsed_result.problem_type}입니다. "
-        f"가능한 원인은 {', '.join(parsed_result.possible_causes)}입니다. "
-        f"먼저 {', '.join(parsed_result.recommended_commands)} 명령어를 확인해보세요. "
-        f"추가로 확인할 점은 다음과 같습니다: {parsed_result.next_question}"
-    )
+    except Exception as e:
+        add_middleware_log(
+            session_id=session_id,
+            middleware="outputParserFallback",
+            level="warn",
+            message="OutputParser 파싱 실패, fallback structured result 사용",
+            detail=str(e),
+        )
+
+        fallback_answer = response.content.strip()
+
+        if not fallback_answer:
+            fallback_answer = (
+                "답변 생성 중 구조화 응답을 만들지 못했습니다. "
+                "아래 점검 명령어를 실행한 뒤 결과를 알려주세요."
+            )
+
+        parsed_result = DiagnosisResult(
+            problem_type=state["problem_type"],
+            possible_causes=[
+                "LLM 응답이 JSON 형식을 지키지 않아 구조화 파싱에 실패했습니다.",
+                "현재 진단 유형과 추천 명령어를 기준으로 후속 점검이 필요합니다.",
+            ],
+            recommended_commands=state["recommended_commands"],
+            next_question="위 명령어 실행 결과를 알려주세요.",
+            user_facing_answer=fallback_answer,
+        )
+
+    answer = parsed_result.user_facing_answer
+
     return {
         "answer": answer,
         "structured_result": parsed_result.model_dump(),
@@ -822,9 +923,9 @@ async def generate_answer_node(state: AgentState) -> dict:
     }
 
 
-def clarification_node(state: AgentState) -> dict:
+async def clarification_node(state: AgentState) -> dict:
     """
-    장애 유형을 판단하기 어려운 경우 추가 정보를 요청하는 노드
+    준비된 장애 유형에 딱 맞지 않는 네트워크 질문에 대해 범용 트러블슈팅 답변을 생성하는 노드
     """
     session_id = state.get("session_id", "default")
 
@@ -834,33 +935,86 @@ def clarification_node(state: AgentState) -> dict:
         tool_args={"problem_type": "UNKNOWN_NETWORK_ISSUE"},
     )
 
-    recommended_commands = command_recommendation_tool.invoke(
+    base_commands = command_recommendation_tool.invoke(
         {"problem_type": "UNKNOWN_NETWORK_ISSUE"}
     )
 
-    structured_result = DiagnosisResult(
-        problem_type="UNKNOWN_NETWORK_ISSUE",
-        possible_causes=[
-            "질문 정보가 부족하여 원인을 특정할 수 없습니다."
-        ],
-        recommended_commands = recommended_commands,
-        next_question = "구체적인 증상, 오류 메시지, 사용 중인 OS, 네트워크 연결 상황을 알려주세요."
+    model_call_limit_middleware(
+        session_id=session_id,
+        purpose="adaptive unknown network troubleshooting answer generation",
     )
 
-    answer = (
-        "현재 질문만으로는 정확한 네트워크 장애 유형을 판단하기 어렵습니다. "
-        "어떤 상황에서 문제가 발생하는지 조금 더 구체적으로 알려주세요. "
-        f"추가로 확인할 점은 다음과 같습니다: {structured_result.next_question}"
-    )
+    messages = [
+        SystemMessage(
+            content=(
+                "당신은 네트워크 트러블슈팅을 도와주는 AI Assistant입니다. "
+                "사용자의 질문이 준비된 장애 유형에 딱 맞지 않더라도, "
+                "네트워크 관련 문제라면 일반적인 트러블슈팅 절차로 대응하세요.\n\n"
+                f"이전 대화 이력:\n{state.get('memory_context', '이전 대화 이력이 없습니다.')}\n\n"
+                "현재 진단 유형은 UNKNOWN_NETWORK_ISSUE입니다. "
+                "이는 네트워크 문제가 아니라는 뜻이 아니라, 준비된 세부 유형으로 특정하기 어렵다는 뜻입니다.\n\n"
+                f"기본 점검 명령어 후보는 다음과 같습니다:\n{base_commands}\n\n"
+                "응답은 반드시 아래 Pydantic JSON 형식 지침을 따르세요.\n"
+                f"{parser.get_format_instructions()}\n\n"
+                "작성 규칙:\n"
+                "- 반드시 JSON 형식으로만 답변하세요.\n"
+                "- 마크다운 코드블록은 사용하지 마세요.\n"
+                "- problem_type은 반드시 UNKNOWN_NETWORK_ISSUE로 작성하세요.\n"
+                "- user_facing_answer에는 사용자가 실제로 읽을 자연스러운 답변을 작성하세요.\n"
+                "- 사용자가 말한 환경, 예를 들어 Docker, VM, VPN, 프록시, 특정 IP, 포트, OS, 오류 메시지가 있으면 반드시 반영하세요.\n"
+                "- 준비된 유형에 딱 맞지 않아도 가능한 원인 후보를 제시하세요.\n"
+                "- 확실하지 않은 원인은 단정하지 말고 가능성으로 표현하세요.\n"
+                "- recommended_commands에는 기본 점검 명령어를 포함하되, 질문 맥락에 맞는 추가 명령어가 있으면 함께 제안하세요.\n"
+                "- next_question에는 추가 진단을 위해 가장 필요한 정보를 하나 물어보세요.\n"
+                "- Docker 또는 컨테이너 문제라면 docker exec, ip route, cat /etc/resolv.conf, ping 8.8.8.8, nslookup google.com 같은 컨테이너 내부 확인 명령어를 제안하세요.\n"
+                "- VM 문제라면 게스트 OS의 IP, NAT/Bridged 설정, 게이트웨이, DNS 설정 확인을 제안하세요.\n"
+                "- VPN 문제라면 VPN 연결 후 라우팅 테이블, DNS suffix, split tunneling, 사내 대역 route 확인을 제안하세요.\n"
+                "- user_facing_answer 안에도 사용자가 바로 따라 할 수 있는 점검 명령어를 3개 이상 포함하세요.\n"
+                "- 당신이 직접 명령어를 실행할 수 있다고 말하지 마세요.\n"
+                "- '실행해 보겠습니다'가 아니라 '실행해보세요', '결과를 알려주세요'라고 말하세요.\n"
+                "- Docker 또는 컨테이너 문제라면 docker exec, ip route, cat /etc/resolv.conf, ping 8.8.8.8, nslookup google.com 같은 컨테이너 내부 확인 명령어를 답변에 직접 포함하세요.\n"
+                "- 답변은 원인 후보 → 확인 명령어 → 결과 해석 → 다음 질문 순서로 작성하세요.\n"
+                "- user_facing_answer에는 명령어만 나열하지 말고, 각 결과를 어떻게 해석해야 하는지도 함께 설명하세요.\n"
+                "- ping 명령어는 무한 실행되지 않도록 가능하면 ping -c 4 형태로 제안하세요.\n"
+                "- Docker 문제에서는 host 인터넷 문제와 container 내부 문제를 구분하는 기준을 설명하세요.\n"
+                "- 마지막에는 컨테이너 ID뿐 아니라 실행 결과도 함께 알려달라고 요청하세요.\n"
+            )
+        ),
+        HumanMessage(content=state["question"]),
+    ]
 
-    return{
+    try:
+        response = await llm.ainvoke(messages)
+        parsed_result = parser.parse(response.content)
+
+        parsed_result.problem_type = "UNKNOWN_NETWORK_ISSUE"
+
+        if not parsed_result.recommended_commands:
+            parsed_result.recommended_commands = base_commands
+
+    except Exception:
+        parsed_result = DiagnosisResult(
+            problem_type="UNKNOWN_NETWORK_ISSUE",
+            possible_causes=[
+                "준비된 장애 유형에 딱 맞지 않거나 질문 정보가 부족하여 원인을 특정하기 어렵습니다."
+            ],
+            recommended_commands=base_commands,
+            next_question="사용 중인 환경, 대상 IP/도메인, 포트 번호, 오류 메시지, 이미 확인한 명령어 결과를 알려주세요.",
+            user_facing_answer=(
+                "준비된 장애 유형에 딱 맞지는 않지만 네트워크 문제일 가능성이 있습니다. "
+                "먼저 IP 연결, DNS, 라우팅, 포트 차단 여부를 차례로 확인해보는 게 좋습니다. "
+                "사용 중인 환경과 오류 메시지, 이미 확인한 결과를 알려주면 더 구체적으로 좁혀볼 수 있습니다."
+            ),
+        )
+
+    return {
         "problem_type": "UNKNOWN_NETWORK_ISSUE",
-        "recommended_commands": recommended_commands,
-        "command_tool_result": recommended_commands,
+        "recommended_commands": parsed_result.recommended_commands,
+        "command_tool_result": parsed_result.recommended_commands,
         "rag_result": "",
-        "answer": answer,
-        "structured_result": structured_result.model_dump(),
-        "should_save_memory": False,
+        "answer": parsed_result.user_facing_answer,
+        "structured_result": parsed_result.model_dump(),
+        "should_save_memory": True,
         "graph_flow": append_graph_flow(state, "conditional_edge:clarification") + ["clarification_node"],
     }
 
@@ -893,6 +1047,7 @@ workflow = StateGraph(AgentState)
 
 workflow.add_node("memory_node", memory_node)
 workflow.add_node("input_guard_node", input_guard_node)
+workflow.add_node("general_chat_node", general_chat_node)
 workflow.add_node("diagnose_node", diagnose_node)
 workflow.add_node("rag_node", rag_node)
 workflow.add_node("command_node", command_node)
@@ -909,7 +1064,7 @@ workflow.add_conditional_edges( #19 버그해결
     route_by_input_status,
     {
         "valid_input": "diagnose_node",
-        "out_of_scope": "clarification_node",
+        "general_chat": "general_chat_node",
         "invalid_input": "invalid_input_node",
     },
 )
@@ -928,6 +1083,7 @@ workflow.add_edge("command_node", "generate_answer_node")
 workflow.add_edge("generate_answer_node", "save_memory_node")
 workflow.add_edge("clarification_node", "save_memory_node")
 workflow.add_edge("invalid_input_node", "save_memory_node")
+workflow.add_edge("general_chat_node", "save_memory_node")
 workflow.add_edge("save_memory_node", END)
 
 agent_graph = workflow.compile()
