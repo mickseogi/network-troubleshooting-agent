@@ -1,10 +1,13 @@
 import os
 import math
+import time
+import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
@@ -40,6 +43,167 @@ class DiagnosisResult(BaseModel):
 parser = PydanticOutputParser(pydantic_object=DiagnosisResult)
 
 memory_stores: dict[str, InMemoryChatMessageHistory] = {}
+
+middleware_sessions: dict[str, dict[str, Any]] = {}
+
+
+def get_middleware_session(session_id: str) -> dict[str, Any]:
+    """
+    session_id별 middleware 상태를 가져옴
+    없으면 새로 생성
+    """
+    if session_id not in middleware_sessions:
+        middleware_sessions[session_id] = {
+            "id": session_id,
+            "logs": [],
+            "model_call_count": 0,
+            "tool_call_count": 0,
+            "config": {
+                "model_call_limit": 20,
+                "tool_call_limit": 50,
+                "log_retention": 50,
+            },
+        }
+    
+    return middleware_sessions[session_id]
+
+
+def add_middleware_log(
+    session_id: str,
+    middleware: str,
+    level: str,
+    message: str,
+    detail: Optional[str] = None,
+) -> dict:
+    """
+    middleware 실행 로그를 session 별로 저장
+    """
+    session = get_middleware_session(session_id)
+
+    log = {
+        "id": f"{time.time()}-{uuid.uuid4().hex[:6]}",
+        "middleware": middleware,
+        "level": level,
+        "message": message,
+        "detail": detail,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    session["logs"].append(log)
+
+    retention = session["config"].get("log_retention", 50)
+    session["logs"] = session["logs"][-retention:]
+
+    return log
+
+
+def get_recent_middleware_logs(session_id: str, limit: int = 20) -> List[dict]:
+    """
+    최근 middleware 로그 반환
+    """
+    session = get_middleware_session(session_id)
+    return session["logs"][-limit:]
+
+
+def request_logging_middleware(session_id: str, question: str) -> None:
+    """
+    Agent 요청 시작 로그를 기록
+    """
+    add_middleware_log(
+        session_id=session_id,
+        middleware="requestLogging",
+        level="info",
+        message="Agent 요청 시작",
+        detail=f"question={question}",
+    )
+
+
+def model_call_limit_middleware(session_id: str, purpose: str) -> None:
+    """
+    LLM 호풀 횟수를 기록하고 계산
+    """
+    session = get_middleware_session(session_id)
+    session["model_call_count"] += 1
+
+    count = session["model_call_count"]
+    limit = session["config"]["model_call_limit"]
+
+    if count > limit:
+        add_middleware_log(
+            session_id=session_id,
+            middleware="modelCallLimit",
+            level="block",
+            message=f"LLM 호출 한도 초과 ({count}/{limit})",
+            detail=f"purpose={purpose}",
+        )
+        raise RuntimeError(f"LLM 호출 한도({limit}회)를 초과했습니다.")
+    
+    add_middleware_log(
+        session_id=session_id,
+        middleware="modelCallLimit",
+        level="pass",
+        message=f"LLM 호출 허용 ({count}/{limit})",
+        detail=f"purpose={purpose}",
+    )
+
+
+def tool_call_limit_middleware(session_id: str, tool_name: str, tool_args: dict) -> None:
+    """
+    Tool 호출 횟수를 기록하고 제한
+    """
+    session = get_middleware_session(session_id)
+    session["tool_call_count"] += 1
+
+    count = session["tool_call_count"]
+    limit = session["config"]["tool_call_limit"]
+
+    if count > limit:
+        add_middleware_log(
+            session_id=session_id,
+            middleware="toolCallLimit",
+            level="block",
+            message=f"Tool 호출 한도 초과 ({count}/{limit})",
+            detail=f"tool={tool_name}, args={tool_args}",
+        )
+        raise RuntimeError(f"Tool 호출 한도({limit}회)를 초과했습니다.")
+    
+    add_middleware_log(
+        session_id=session_id,
+        middleware="toolCallLimit",
+        level="pass",
+        message=f"Tool 호출 허용 ({count}/{limit})",
+        detail=f"tool={tool_name}, args={tool_args}",
+    )
+
+
+def agent_finish_logging_middleware(session_id: str, final_state: dict) -> None:
+    """
+    Agent 실행 완료 로그를 기록
+    """
+    add_middleware_log(
+        session_id=session_id,
+        middleware="agentFinishLogging",
+        level="info",
+        message="Agent 실행 완료",
+        detail=(
+            f"diagnosis={final_state.get('diagnosis_tool_result')}, "
+            f"memory_saved={final_state.get('memory_saved')}, "
+            f"graph_flow={final_state.get('graph_flow')}"
+        ),
+    )
+
+
+def agent_error_logging_middleware(session_id: str, error: Exception) -> None:
+    """
+    Agent 실행 중 에러 로그를 기록
+    """
+    add_middleware_log(
+        session_id=session_id,
+        middleware="agentErrorLogging",
+        level="error",
+        message="Agent 실행 중 오류 발생",
+        detail=str(error),
+    )
 
 
 def get_memory_history(session_id: str) -> InMemoryChatMessageHistory:
@@ -364,10 +528,24 @@ def diagnose_node(state: AgentState) -> dict:
     """
     사용자 질문과 이전 대화 이력을 기반으로 네트워크 장애 유형을 분류하는 노드
     """
+    session_id = state.get("session_id", "default")
+
     diagnosis_input = (
         f"이전 대화 이력:\n{state.get('memory_context','')}\n\n"
         f"현재 질문:\n{state['question']}"
     )
+
+    tool_call_limit_middleware(
+        session_id=session_id,
+        tool_name="network_diagnosis_tool",
+        tool_args={"question": state["question"]},
+    )
+
+    model_call_limit_middleware(
+        session_id=session_id,
+        purpose="network diagnosis classification",
+    )
+
     diagnosis_type = network_diagnosis_tool.invoke(
         {"question": diagnosis_input}
     )
@@ -391,11 +569,20 @@ def rag_node(state: AgentState) -> dict:
     """
     사용자 질문과 이전 대화 이력을 함께 사용하여 RAG 문서를 검색하는 노드
     """
+    session_id = state.get("session_id", "default")
+
     rag_query =(
         f"이전 대화 이력:\n{state.get('memory_context', '')}\n\n"
         f"현재 질문:\n{state['question']}\n\n"
         f"진단 유형:\n{state['problem_type']}"
     )
+
+    tool_call_limit_middleware(
+        session_id=session_id,
+        tool_name="rag_search_tool",
+        tool_args={"question": state["question"]},
+    )
+
     rag_result = rag_search_tool.invoke(
         {"question": rag_query}
     )
@@ -409,6 +596,14 @@ def command_node(state: AgentState) -> dict:
     """
     장애 유형에 따라 점검 명령어를 추천하는 노드
     """
+    session_id = state.get("session_id", "default")
+
+    tool_call_limit_middleware(
+        session_id=session_id,
+        tool_name="command_recommendation_tool",
+        tool_args={"problem_type": state["problem_type"]},
+    )
+
     recommended_commands = command_recommendation_tool.invoke(
         {"problem_type": state["problem_type"]}
     )
@@ -423,6 +618,13 @@ async def generate_answer_node(state: AgentState) -> dict:
     """
     진단 결과, RAG 검색 결과, 추천 명령어를 바탕으로 최종 답변을 생성하는 노드
     """
+    session_id = state.get("session_id", "default")
+
+    model_call_limit_middleware(
+        session_id=session_id,
+        purpose="final troubleshooting answer generation",
+    )
+
     messages = [
         SystemMessage(
             content=(
@@ -476,6 +678,14 @@ def clarification_node(state: AgentState) -> dict:
     """
     장애 유형을 판단하기 어려운 경우 추가 정보를 요청하는 노드
     """
+    session_id = state.get("session_id", "default")
+
+    tool_call_limit_middleware(
+        session_id=session_id,
+        tool_name="command_recommendation_tool",
+        tool_args={"problem_type": "UNKNOWN_NETWORK_ISSUE"},
+    )
+
     recommended_commands = command_recommendation_tool.invoke(
         {"problem_type": "UNKNOWN_NETWORK_ISSUE"}
     )
@@ -572,11 +782,19 @@ async def health():
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     try:
+        request_logging_middleware(
+            session_id=req.session_id,
+            question=req.question,
+        )
         final_state = await agent_graph.ainvoke(
             {
                 "question": req.question,
                 "session_id": req.session_id,
             }
+        )
+        agent_finish_logging_middleware(
+            session_id=req.session_id,
+            final_state=final_state,
         )
         return{
             "success": True,
@@ -599,14 +817,28 @@ async def chat(req: ChatRequest):
             "rag_document_count": rag_document_count,
             "graph_used": True,
             "graph_flow": final_state.get("graph_flow", []),
+            "middleware_used": True,
+            "middleware_logs": get_recent_middleware_logs(req.session_id),
+            "middleware_stats": {
+                "model_call_count": get_middleware_session(req.session_id)["model_call_count"],
+                "tool_call_count": get_middleware_session(req.session_id)["tool_call_count"],
+            },
             "model": "gpt-4o-mini",
         }
         
     
     except Exception as e:
+        agent_error_logging_middleware(
+            session_id=req.session_id,
+            error=e,
+        )
+
         return {
             "success": False,
             "error": str(e),
+            "session_id": req.session_id,
+            "middleware_used": True,
+            "middleware_logs": get_recent_middleware_logs(req.session_id),
         }
 
 
@@ -620,4 +852,66 @@ async def reset_memory(req: ResetMemoryRequest):
     return{
         "success": True,
         "message": f"{req.session_id} 세션 메모리가 초기화되었습니다."
+    }
+
+
+class ResetMiddlewareRequest(BaseModel):
+    session_id: str = "default"
+
+
+@app.get("/api/middleware/logs")
+async def get_middleware_logs(
+    session_id: str = Query(default="default"),
+    limit: int = Query(default=20),
+):
+    session = get_middleware_session(session_id)
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "logs": get_recent_middleware_logs(session_id, limit),
+        "stats": {
+            "model_call_count": session["model_call_count"],
+            "tool_call_count": session["tool_call_count"],
+        },
+        "config": session["config"],
+    }
+
+
+@app.post("/api/middleware/reset")
+async def reset_middleware(req: ResetMiddlewareRequest):
+    middleware_sessions.pop(req.session_id, None)
+
+    return {
+        "success": True,
+        "message": f"{req.session_id} 세션 middleware 로그가 초기화되었습니다.",
+    }
+
+
+
+class MiddlewareConfigRequest(BaseModel):
+    session_id: str = "default"
+    model_call_limit: Optional[int] = None
+    tool_call_limit: Optional[int] = None
+    log_retention: Optional[int] = None
+
+
+
+@app.post("/api/middleware/config")
+async def update_middleware_config(req: MiddlewareConfigRequest):
+    session = get_middleware_session(req.session_id)
+
+    if req.model_call_limit is not None:
+        session["config"]["model_call_limit"] = req.model_call_limit
+
+    if req.tool_call_limit is not None:
+        session["config"]["tool_call_limit"] = req.tool_call_limit
+
+    if req.log_retention is not None:
+        session["config"]["log_retention"] = req.log_retention
+
+    return {
+        "success": True,
+        "session_id": req.session_id,
+        "config": session["config"],
     }
