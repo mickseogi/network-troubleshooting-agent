@@ -46,16 +46,43 @@ function loadLastSessionId() {
   }
 }
 
-function isRepeatedMieumInput(question) {
+function isRepeatedNoiseInput(question) {
   const compactText = question.trim().replace(/\s/g, "");
+  const chars = [...compactText];
 
-  if (compactText.length < 30) {
+  if (chars.length < 6) {
     return false;
   }
 
-  const mieumCount = [...compactText].filter((char) => char === "ㅁ").length;
+  const counts = {};
 
-  return mieumCount / compactText.length >= 0.8;
+  for (const char of chars) {
+    counts[char] = (counts[char] || 0) + 1;
+  }
+
+  const maxCount = Math.max(...Object.values(counts));
+  const mostCommonRatio = maxCount / chars.length;
+
+  if (mostCommonRatio >= 0.8) {
+    return true;
+  }
+
+  const maxPatternSize = Math.min(3, Math.floor(chars.length / 2));
+
+  for (let patternSize = 1; patternSize <= maxPatternSize; patternSize += 1) {
+    if (chars.length % patternSize !== 0) {
+      continue;
+    }
+
+    const pattern = chars.slice(0, patternSize).join("");
+    const repeatCount = chars.length / patternSize;
+
+    if (repeatCount >= 3 && pattern.repeat(repeatCount) === compactText) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 async function loadSession(sessionId = getSessionId()) {
@@ -102,7 +129,7 @@ async function handleSubmit(event) {
     return;
   }
 
-  if (isRepeatedMieumInput(question)) {
+  if (isRepeatedNoiseInput(question)) {
     addAssistantMessage(
       "의미 없는 반복 입력으로 보여 진단을 실행하지 않았습니다. 네트워크 장애 상황을 문장으로 입력해주세요."
     );
