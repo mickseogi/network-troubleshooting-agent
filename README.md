@@ -726,6 +726,7 @@ INVALID_INPUT
 | 항목 | 내용 |
 |---|---|
 | 작성자 | 서민석 |
+| 학번 | 2022041045 |
 | 과목 | AI Service Design and Implementation Practice |
 | 프로젝트 | Network Troubleshooting Agent |
 
