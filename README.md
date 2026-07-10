@@ -372,7 +372,6 @@ session_id = "static-ip-test"
 | `tool_call_limit_middleware` | Tool 호출 횟수 기록 및 제한 |
 | `agent_finish_logging_middleware` | Agent 실행 완료 로그 기록 |
 | `agent_error_logging_middleware` | Agent 실행 중 에러 로그 기록 |
-| `outputParserFallback` | OutputParser 실패 시 fallback 로그 기록 |
 
 Middleware 로그는 API 응답과 `/api/middleware/logs`에서 확인할 수 있습니다.
 
