@@ -233,8 +233,7 @@ flowchart TD
 
 ## 7.1 Tools
 
-본 프로젝트는 최소 2개 이상의 Tool 요구사항을 충족하기 위해  
-다음 3개의 Tool을 사용합니다.
+본 프로젝트는 다음 3개의 Tool을 사용합니다.
 
 ### 1. Network Diagnosis Tool
 
